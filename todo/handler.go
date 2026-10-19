@@ -1,19 +1,18 @@
 package todo
 
 import (
-	"database/sql"
 	"errors"
-	"fmt"
 	"log"
 	"net/http"
 	"strconv"
 
 	"github.com/gin-gonic/gin"
 	"github.com/go-playground/validator/v10"
+	"gorm.io/gorm"
 )
 
 type TodoHandler struct {
-	DB *sql.DB
+	DB *gorm.DB
 }
 
 // respondError mengirim pesan error dengan format seragam {"error": "..."}
@@ -47,68 +46,67 @@ func parseID(c *gin.Context) (int, bool) {
 	return id, true
 }
 
+// List - GET /todos
+// Query opsional: ?done=true|false, ?page=1, ?limit=10
 func (h *TodoHandler) List(c *gin.Context) {
-	query := "SELECT id, title, is_done FROM todos"
-	args := []any{}
-
-	fmt.Println("query =>", query)
-
+	query := h.DB.WithContext(c.Request.Context()).Model(&Todo{})
 	if done := c.Query("done"); done != "" {
 		isDone, err := strconv.ParseBool(done)
 		if err != nil {
 			respondError(c, http.StatusBadRequest, "Parameter done harus true atau false")
 			return
 		}
-		query += " WHERE is_done = $1"
-		args = append(args, isDone)
+		query = query.Where("is_done = ?", isDone)
 	}
 
-	rows, err := h.DB.QueryContext(c.Request.Context(), query+" ORDER BY id", args...)
-	if err != nil {
-		log.Println("List:", err)
+	// Pagination: nilai tidak valid diganti nilai bawaan
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	if page < 1 {
+		page = 1
+	}
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "10"))
+	if limit < 1 || limit > 100 {
+		limit = 10
+	}
+
+	// Session(&gorm.Session{}) membuat salinan aman agar query yang sama
+	// bisa dipakai dua kali (Count lalu Find) tanpa saling memengaruhi
+	var total int64
+	if err := query.Session(&gorm.Session{}).Count(&total).Error; err != nil {
+		log.Println("List count:", err)
 		respondError(c, http.StatusInternalServerError, "Gagal mengambil data")
 		return
 	}
 
 	todos := []Todo{} // slice kosong agar hasilnya [] (bukan null)
-	for rows.Next() {
-		var t Todo
-		if err := rows.Scan(&t.ID, &t.Title, &t.IsDone); err != nil {
-			log.Println("List scan:", err)
-			respondError(c, http.StatusInternalServerError, "Gagal membaca data")
-			return
-		}
-		todos = append(todos, t)
-	}
-	if err := rows.Err(); err != nil {
-		log.Println("List rows:", err)
-		respondError(c, http.StatusInternalServerError, "Gagal membaca data")
+	err := query.Order("id").Limit(limit).Offset((page - 1) * limit).Find(&todos).Error
+	if err != nil {
+		log.Println("List find:", err)
+		respondError(c, http.StatusInternalServerError, "Gagal mengambil data")
 		return
 	}
 
+	c.Header("X-Total-Count", strconv.FormatInt(total, 10))
 	c.JSON(http.StatusOK, todos)
-}
+} // <--- KURUNG TUTUP TADI HILANG DI SINI
 
-// Detail - GET /todos/:id
+// GetByID - GET /todos/:id
 func (h *TodoHandler) GetByID(c *gin.Context) {
 	id, ok := parseID(c)
 	if !ok {
 		return
 	}
-
 	var t Todo
-	err := h.DB.QueryRowContext(c.Request.Context(),
-		"SELECT id, title, is_done FROM todos WHERE id = $1", id).Scan(&t.ID, &t.Title, &t.IsDone)
+	err := h.DB.WithContext(c.Request.Context()).First(&t, id).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		respondError(c, http.StatusNotFound, "Todo tidak ditemukan")
+		return
+	}
 	if err != nil {
-		if err == sql.ErrNoRows {
-			respondError(c, http.StatusNotFound, "Todo tidak ditemukan")
-			return
-		}
 		log.Println("GetByID:", err)
 		respondError(c, http.StatusInternalServerError, "Gagal mengambil data")
 		return
 	}
-
 	c.JSON(http.StatusOK, t)
 }
 
@@ -120,18 +118,15 @@ func (h *TodoHandler) Create(c *gin.Context) {
 		return
 	}
 
+	// ID diisi otomatis oleh GORM setelah INSERT berhasil
 	t := Todo{Title: req.Title, IsDone: req.IsDone}
-	err := h.DB.QueryRowContext(c.Request.Context(),
-		"INSERT INTO todos (title, is_done) VALUES ($1, $2) RETURNING id",
-		t.Title, t.IsDone).Scan(&t.ID)
-	if err != nil {
+	if err := h.DB.WithContext(c.Request.Context()).Create(&t).Error; err != nil {
 		log.Println("Create:", err)
 		respondError(c, http.StatusInternalServerError, "Gagal menyimpan data")
 		return
 	}
-
 	c.JSON(http.StatusCreated, t)
-}
+} // <--- KURUNG TUTUP TADI HILANG DI SINI
 
 // Update - PUT /todos/:id
 func (h *TodoHandler) Update(c *gin.Context) {
@@ -139,54 +134,61 @@ func (h *TodoHandler) Update(c *gin.Context) {
 	if !ok {
 		return
 	}
-
 	var req UpdateTodoRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		respondError(c, http.StatusBadRequest, validationMessage(err))
 		return
 	}
-
-	t := Todo{Title: req.Title, IsDone: req.IsDone}
-	err := h.DB.QueryRowContext(c.Request.Context(),
-		"UPDATE todos SET title = $1, is_done = $2 WHERE id = $3 RETURNING id",
-		t.Title, t.IsDone, id).Scan(&t.ID)
-	if errors.Is(err, sql.ErrNoRows) {
-		respondError(c, http.StatusNotFound, "Todo tidak ditemukan")
+	db := h.DB.WithContext(c.Request.Context())
+	var t Todo
+	if err := db.First(&t, id).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			respondError(c, http.StatusNotFound, "Todo tidak ditemukan")
+			return
+		}
+		log.Println("Update find:", err)
+		respondError(c, http.StatusInternalServerError, "Gagal mengubah data")
 		return
-	}
+	} // <--- TEKS SANGKUTAN JOB SHEET SUDAH DIHAPUS DARI SINI
+
+	// Pakai map agar is_done = false tetap ikut diubah
+	// (Updates dengan struct mengabaikan field bernilai nol)
+	err := db.Model(&t).Updates(map[string]any{
+		"title":   req.Title,
+		"is_done": req.IsDone,
+	}).Error
 	if err != nil {
 		log.Println("Update:", err)
 		respondError(c, http.StatusInternalServerError, "Gagal mengubah data")
 		return
 	}
-
 	c.JSON(http.StatusOK, t)
 }
 
+// Delete - DELETE /todos/:id
 func (h *TodoHandler) Delete(c *gin.Context) {
 	id, ok := parseID(c)
 	if !ok {
 		return
 	}
-
-	result, err := h.DB.ExecContext(c.Request.Context(), "DELETE FROM todos WHERE id = $1", id)
-	if err != nil {
-		log.Println("Delete:", err)
+	result := h.DB.WithContext(c.Request.Context()).Delete(&Todo{}, id)
+	if result.Error != nil {
+		log.Println("Delete:", result.Error)
 		respondError(c, http.StatusInternalServerError, "Gagal menghapus data")
 		return
 	}
-
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		log.Println("Delete:", err)
-		respondError(c, http.StatusInternalServerError, "Gagal menghapus data")
-		return
-	}
-
-	if rowsAffected == 0 {
+	// RowsAffected = jumlah baris yang terhapus; 0 berarti ID tidak ada
+	if result.RowsAffected == 0 {
 		respondError(c, http.StatusNotFound, "Todo tidak ditemukan")
 		return
 	}
+	c.JSON(http.StatusOK, gin.H{"message": "Todo berhasil dihapus"})
+}
 
-	c.Status(http.StatusNoContent)
+func RegisterRoutes(v1 *gin.RouterGroup, handler *TodoHandler) {
+	v1.GET("/todos", handler.List)          // Daftar todo
+	v1.GET("/todos/:id", handler.GetByID)   // Detail todo
+	v1.POST("/todos", handler.Create)       // Tambah todo baru
+	v1.PUT("/todos/:id", handler.Update)    // Ubah todo
+	v1.DELETE("/todos/:id", handler.Delete) // Hapus todo
 }
